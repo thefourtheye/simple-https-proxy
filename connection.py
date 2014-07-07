@@ -1,13 +1,14 @@
-from threading import Thread
 from http_stream_handler import HTTPStreamHandler
 from gen_ca_cert import gen_cert
 from http_request_parser import HTTPRequest, HTTPRequestException
 import OpenSSL
 import socket
 import urllib.request
+import urllib.error
+import requests
 
 
-class ConnectionHandler(Thread):
+class ConnectionHandler:
     def __init__(self, client_socket, _):
         super(ConnectionHandler, self).__init__()
         self.is_secure, self.is_closed, self.context = False, False, {}
@@ -30,7 +31,7 @@ class ConnectionHandler(Thread):
         server_ssl.do_handshake()
         self.set_socket(server_ssl, True)
 
-    def run(self):
+    def service(self, interceptor):
         try:
             self.request = HTTPRequest(self.stream)
         except HTTPRequestException:
@@ -40,16 +41,37 @@ class ConnectionHandler(Thread):
             self.switch_to_https()
             self.request = HTTPRequest(self.stream, True)
 
-        if self.request.get_method() in {"GET", "POST", "DELETE", "PUT"}:
-            print(self.request.get_url())
+        print(self.request.get_url(), self.request.get_method())
+        if self.request.get_method() in {"GET", "POST", "DELETE", "PUT", "PATCH"}:
             try:
-                f = urllib.request.urlopen(self.request.get_url())
-                response = f.read()
-                self.stream.send(response)
+                from pprint import pprint
+                http_method = getattr(requests, self.request.get_method().lower())
+                result = http_method(self.request.get_url(), data=self.request.body,
+                                     headers=self.request.get_headers(),
+                                     allow_redirects=False, timeout=10)
+
+                if result.status_code < 200 or result.status_code > 399:
+                    pprint(result.status_code)
+
+                if 'content-security-policy' in result.headers:
+                    pprint(result.headers['content-security-policy'].split())
+
+                if 300 <= result.status_code < 400:
+                    pprint("Being redirected")
+                    pprint(self.request.get_url())
+                    pprint(dict(result.headers))
+
+                interceptor(self.request, result.content + str.encode("\r\n"))
+                self.stream.send(result.content + str.encode("\r\n"))
             except urllib.error.HTTPError as e:
                 print("Failed: {}, Code: {}".format(self.request.get_url(), e.code))
-                self.stream.send(str.encode("{} {}".format(self.request.get_version(), e.code)))
-            # self.stream.send(str.encode("HTTP/1.1 200 OK\r\n\r\n<h2>GET {}</h2>".format(self.request.get_url())))
+                self.stream.send(str.encode("{} {}"
+                                            .format(self.request.get_version(), e.code)))
+            except OSError as e:
+                pprint(e)
+                print("Failed: {}, Code: {}".format(self.request.get_url(), 408))
+                self.stream.send(str.encode("{} 408\r\n\r\n"
+                                            .format(self.request.get_version())))
         else:
             self.stream.send(b"HTTP/1.1 400 Unknown HTTP Verb\r\n\r\n")
         self.close()
@@ -57,13 +79,16 @@ class ConnectionHandler(Thread):
     def close(self):
         if not self.is_closed:
             # print("Closing the Client Socket")
-            self.is_closed = True
-            self.stream.close()
-            if self.is_secure:
-                self.socket.shutdown()
-                self.socket.sock_shutdown(socket.SHUT_WR)
-            else:
-                self.socket.shutdown(socket.SHUT_WR)
+            try:
+                self.is_closed = True
+                self.stream.close()
+                if self.is_secure:
+                    self.socket.shutdown()
+                    self.socket.sock_shutdown(socket.SHUT_WR)
+                else:
+                    self.socket.shutdown(socket.SHUT_WR)
+            except OpenSSL.SSL.Error as e:
+                print(e)
             self.socket.close()
 
     def __del__(self):
